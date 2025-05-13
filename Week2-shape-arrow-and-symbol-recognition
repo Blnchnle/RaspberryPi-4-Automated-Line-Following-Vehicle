@@ -1,0 +1,173 @@
+import cv2
+import numpy as np
+from picamera2 import Picamera2
+import os
+import logging
+import argparse
+import concurrent.futures
+import time
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Define command-line arguments
+parser = argparse.ArgumentParser(description="Real-time symbol detection with Raspberry Pi camera.")
+parser.add_argument('--symbol_folder', type=str, default="/home/user/picture_recognition", 
+                    help='Folder with symbol images (.jpg, .png)')
+parser.add_argument('--resolution', type=int, nargs=2, default=(640, 480), 
+                    help='Camera resolution (width height)')
+parser.add_argument('--max_workers', type=int, default=4, 
+                    help='Number of threads for parallel processing')
+parser.add_argument('--inlier_threshold', type=int, default=10, 
+                    help='Minimum inliers for homography detection')
+parser.add_argument('--min_matches', type=int, default=4, 
+                    help='Minimum good matches for homography')
+parser.add_argument('--display', type=bool, default=True, 
+                    help='Display camera feed with detections')
+
+args = parser.parse_args()
+
+# Define symbol paths
+symbol_paths = {
+    "pacman": "shape_pacman.jpg",
+    "pentagon": "shape_pentagon.jpg",
+    "hexagon": "shape_hexagon.jpg",
+    "circle": "shape_circle.jpg",
+    "triangle": "shape_triangle.jpg",
+    "rectangle": "shape_rectangle.jpg",
+    "arrow_up": "arrow_rec_up.jpg",
+    "arrow_down": "arrow_rec_down.jpg",
+    "arrow_left": "arrow_rec_left.jpg",
+    "arrow_right": "arrow_rec_right.jpg",
+    "arrow_cir_up": "arrow_cir_up.jpg",
+    "arrow_cir_down": "arrow_cir_down.jpg",
+    "arrow_cir_right": "arrow_cir_right.jpg",
+    "arrow_cir_left": "arrow_cir_left.jpg",
+    "stop": "special_symbol_stop.jpg",
+    "pause": "special_symbol_pause.jpg",
+    "distance": "special_symbol_distance.jpg",
+    "face_rec": "special_symbol_face_rec.jpg",
+}
+
+# Load symbol images in grayscale
+symbol_images = {}
+for name, filename in symbol_paths.items():
+    path = os.path.join(args.symbol_folder, filename)
+    image = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        logging.error(f"Could not load {path}. Check the file path.")
+        continue
+    symbol_images[name] = image
+
+if not symbol_images:
+    logging.error("No valid symbol images loaded. Exiting.")
+    exit()
+
+# Initialize ORB detector
+orb = cv2.ORB_create(nfeatures=500)
+
+# Compute keypoints, descriptors, and shapes
+symbol_features = {}
+for name, img in symbol_images.items():
+    kp, des = orb.detectAndCompute(img, None)
+    if des is None:
+        logging.error(f"No features in {name}. Skipping.")
+        continue
+    h, w = img.shape
+    symbol_features[name] = (kp, des, (h, w))
+
+if not symbol_features:
+    logging.error("No symbols with features detected. Exiting.")
+    exit()
+
+# Initialize the camera
+try:
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(main={"size": args.resolution})
+    picam2.configure(config)
+    picam2.start()
+    time.sleep(2)  # Camera warm-up
+except Exception as e:
+    logging.error(f"Camera initialization failed: {e}")
+    exit()
+
+# Set up Brute-Force matcher
+bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+
+# Function to process symbols in parallel
+def process_symbol(name, kp_symbol, des_symbol, shape, kp_frame, des_frame):
+    try:
+        matches = bf.knnMatch(des_symbol, des_frame, k=2)
+        good_matches = [m for m in matches if len(m) == 2 and m[0].distance < 0.75 * m[1].distance]
+        if len(good_matches) >= args.min_matches:
+            src_pts = np.float32([kp_symbol[m[0].queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+            dst_pts = np.float32([kp_frame[m[0].trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+            M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+            if M is not None:
+                inliers = np.sum(mask)
+                if inliers >= args.inlier_threshold:
+                    h, w = shape
+                    pts = np.float32([[0, 0], [0, h-1], [w-1, h-1], [w-1, 0]]).reshape(-1, 1, 2)
+                    dst = cv2.perspectiveTransform(pts, M)
+                    return name, inliers, dst
+        return name, 0, None
+    except Exception as e:
+        logging.error(f"Error processing {name}: {e}")
+        return name, 0, None
+
+# Main loop variables
+prev_detected = None
+
+# Process frames
+try:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+        while True:
+            start_time = time.time()
+            frame = picam2.capture_array()
+            if frame is None:
+                logging.error("Failed to capture frame.")
+                continue
+
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            kp_frame, des_frame = orb.detectAndCompute(gray_frame, None)
+            if des_frame is None:
+                continue
+
+            symbol_args = [(name, kp, des, shape, kp_frame, des_frame) 
+                           for name, (kp, des, shape) in symbol_features.items()]
+
+            detections = list(executor.map(lambda x: process_symbol(*x), symbol_args))
+
+            best_detection = max(detections, key=lambda x: x[1], default=(None, 0, None))
+            name, inliers, dst = best_detection
+
+            if inliers >= args.inlier_threshold:
+                if name != prev_detected:
+                    print(f"{symbol_paths[name]} detected with {inliers} inliers")
+                    prev_detected = name
+                if args.display:
+                    filename = symbol_paths[name]
+                    frame = cv2.polylines(frame, [np.int32(dst)], True, (0, 255, 0), 3, cv2.LINE_AA)
+                    cv2.putText(frame, f"{filename} ({inliers})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            else:
+                if prev_detected is not None:
+                    print("No symbol detected")
+                    prev_detected = None
+
+            fps = 1 / (time.time() - start_time)
+            if args.display:
+                cv2.putText(frame, f"FPS: {fps:.1f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                cv2.imshow('Camera Feed', frame)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+except KeyboardInterrupt:
+    print("Interrupted by user")
+except Exception as e:
+    logging.error(f"Main loop error: {e}")
+finally:
+    picam2.stop()
+    cv2.destroyAllWindows()
