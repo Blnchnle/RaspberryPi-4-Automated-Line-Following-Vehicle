@@ -1,0 +1,173 @@
+import time
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+from picamera2 import Picamera2
+
+# === GPIO Motor Pins ===
+ENA = 22
+ENB = 26
+LEFT_MOTOR_FORWARD = 5
+LEFT_MOTOR_BACKWARD = 6
+RIGHT_MOTOR_FORWARD = 13
+RIGHT_MOTOR_BACKWARD = 19
+
+# === GPIO Setup ===
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(
+    [LEFT_MOTOR_FORWARD, LEFT_MOTOR_BACKWARD,
+     RIGHT_MOTOR_FORWARD, RIGHT_MOTOR_BACKWARD,
+     ENA, ENB],
+    GPIO.OUT
+)
+
+# === PWM Setup ===
+FREQ = 700
+LEFT_FWD = GPIO.PWM(LEFT_MOTOR_FORWARD, FREQ)
+LEFT_BWD = GPIO.PWM(LEFT_MOTOR_BACKWARD, FREQ)
+RIGHT_FWD = GPIO.PWM(RIGHT_MOTOR_FORWARD, FREQ)
+RIGHT_BWD = GPIO.PWM(RIGHT_MOTOR_BACKWARD, FREQ)
+ENA_PWM = GPIO.PWM(ENA, FREQ)
+ENB_PWM = GPIO.PWM(ENB, FREQ)
+for p in (LEFT_FWD, LEFT_BWD, RIGHT_FWD, RIGHT_BWD, ENA_PWM, ENB_PWM):
+    p.start(0)
+ENA_PWM.ChangeDutyCycle(100)
+ENB_PWM.ChangeDutyCycle(100)
+
+# === Speed & PID Params ===
+MAX_SPEED = 60
+MIN_SPEED = 20
+TURN_SPEED = 50
+TURN_THRESHOLD = 50
+Kp, Ki, Kd = 70.0, 0.0, 0.0
+prev_error, integral = 0.0, 0.0
+
+# === HSV Ranges ===
+COLOR_RANGES = {
+    "black": [(0, 179, 0, 102, 0, 66)],
+    "blue": [(0, 131, 150, 255, 8, 125)],
+    "green": [(34, 67, 167, 255, 111, 179)],
+    "yellow": [(82, 110, 36, 255, 172, 255)],
+    "red": [(109, 134, 188, 255, 88, 255)]
+}
+
+# === Camera Init ===
+picam2 = Picamera2()
+picam2.preview_configuration.main.size = (320, 240)
+picam2.preview_configuration.main.format = "RGB888"
+picam2.preview_configuration.controls.FrameRate = 30
+picam2.configure("preview")
+picam2.start()
+time.sleep(2)
+
+# === Mask & Line Functions ===
+def get_mask(hsv, color):
+    ranges = COLOR_RANGES[color]
+    if color == "red":
+        mask1 = cv2.inRange(hsv, np.array([ranges[0][0], ranges[0][2], ranges[0][4]]),
+                            np.array([ranges[0][1], ranges[0][3], ranges[0][5]]))
+        return mask1
+    r = ranges[0]
+    return cv2.inRange(hsv, np.array([r[0], r[2], r[4]]), np.array([r[1], r[3], r[5]]))
+
+def find_line(mask):
+    roi = mask[120:240, :]
+    cnts, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    c = max(cnts, key=cv2.contourArea)
+    M = cv2.moments(c)
+    if M["m00"] == 0:
+        return None
+    return int(M["m10"] / M["m00"])
+
+def control_motors(cx, width):
+    global prev_error, integral
+    center = width // 2
+    if cx is None:
+        LEFT_FWD.ChangeDutyCycle(0); RIGHT_FWD.ChangeDutyCycle(0)
+        LEFT_BWD.ChangeDutyCycle(30); RIGHT_BWD.ChangeDutyCycle(30)
+        ENA_PWM.ChangeDutyCycle(30); ENB_PWM.ChangeDutyCycle(30)
+        time.sleep(0.8)
+        LEFT_BWD.ChangeDutyCycle(0); RIGHT_BWD.ChangeDutyCycle(0)
+        ENA_PWM.ChangeDutyCycle(0); ENB_PWM.ChangeDutyCycle(0)
+        return
+    error = cx - center
+    if abs(error) > TURN_THRESHOLD:
+        if error > 0:
+            LEFT_BWD.ChangeDutyCycle(TURN_SPEED); RIGHT_FWD.ChangeDutyCycle(TURN_SPEED)
+        else:
+            LEFT_FWD.ChangeDutyCycle(TURN_SPEED); RIGHT_BWD.ChangeDutyCycle(TURN_SPEED)
+        ENA_PWM.ChangeDutyCycle(TURN_SPEED); ENB_PWM.ChangeDutyCycle(TURN_SPEED)
+        return
+    integral += error
+    derivative = error - prev_error
+    corr = Kp * error + Ki * integral + Kd * derivative
+    ls = max(min(MAX_SPEED - corr, MAX_SPEED), MIN_SPEED)
+    rs = max(min(MAX_SPEED + corr, MAX_SPEED), MIN_SPEED)
+    LEFT_FWD.ChangeDutyCycle(ls); RIGHT_FWD.ChangeDutyCycle(rs)
+    LEFT_BWD.ChangeDutyCycle(0); RIGHT_BWD.ChangeDutyCycle(0)
+    ENA_PWM.ChangeDutyCycle(ls); ENB_PWM.ChangeDutyCycle(rs)
+    prev_error = error
+
+# === Manual Color Selection ===
+def select_colors():
+    print("Available colors: red, green, yellow, blue")
+    color1 = input("Enter first color to follow: ").strip().lower()
+    color2 = input("Enter second color to follow: ").strip().lower()
+    if color1 not in COLOR_RANGES or color2 not in COLOR_RANGES:
+        print("Invalid colors. Defaulting to red and green.")
+        return "red", "green"
+    return color1, color2
+
+# === Main Loop ===
+color1, color2 = select_colors()
+print(f"Following colors: {color1}, {color2} (and black by default)")
+
+try:
+    while True:
+        frame = picam2.capture_array()
+        hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+
+        mask1 = get_mask(hsv, color1)
+        mask2 = get_mask(hsv, color2)
+        maskb = get_mask(hsv, "black")
+
+        mask_display = maskb
+        if find_line(mask1) is not None:
+            mask_display = mask1
+        elif find_line(mask2) is not None:
+            mask_display = mask2
+
+        cv2.imshow("Current Mask", mask_display)
+        cv2.imshow("Mask1", mask1)
+        cv2.imshow("Mask2", mask2)
+        cv2.imshow("Mask Black", maskb)
+
+        cx = find_line(mask1)
+        if cx is not None:
+            line = color1
+        else:
+            cx = find_line(mask2)
+            if cx is not None:
+                line = color2
+            else:
+                cx = find_line(maskb)
+                line = "black"
+        control_motors(cx, frame.shape[1])
+
+        cv2.imshow("Camera View", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except KeyboardInterrupt:
+    print("Exiting...")
+
+finally:
+    for p in (LEFT_FWD, LEFT_BWD, RIGHT_FWD, RIGHT_BWD, ENA_PWM, ENB_PWM):
+        p.stop()
+    GPIO.cleanup()
+    picam2.close()
+    cv2.destroyAllWindows()
